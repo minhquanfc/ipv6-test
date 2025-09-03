@@ -171,16 +171,34 @@ test_proxy() {
 
     echo "Testing: $TEST_IP:$TEST_PORT (NO AUTH)"
 
-    # Test connection without authentication
-    timeout 10 curl -x $TEST_IP:$TEST_PORT -s https://httpbin.org/ip
+    # Kiểm tra port có listen không
+    if netstat -tlnp | grep ":$TEST_PORT " > /dev/null; then
+        echo "✅ Port $TEST_PORT is listening"
 
-    if [ $? -eq 0 ]; then
-        echo "✅ Proxy test successful!"
+        # Test connection without authentication
+        echo "🌐 Testing proxy connection..."
+        RESULT=$(timeout 10 curl -x $TEST_IP:$TEST_PORT -s https://httpbin.org/ip 2>/dev/null)
+
+        if [ $? -eq 0 ] && [ ! -z "$RESULT" ]; then
+            echo "✅ Proxy test successful!"
+            echo "📍 Response: $RESULT"
+        else
+            echo "⚠️ External test failed, trying localhost..."
+            RESULT=$(timeout 10 curl -x 127.0.0.1:$TEST_PORT -s https://httpbin.org/ip 2>/dev/null)
+            if [ $? -eq 0 ] && [ ! -z "$RESULT" ]; then
+                echo "✅ Localhost test successful!"
+            else
+                echo "❌ Proxy test failed"
+                echo "🔍 Checking 3proxy process..."
+                ps aux | grep 3proxy | grep -v grep
+                echo "🔍 Checking listening ports..."
+                netstat -tlnp | grep 3proxy
+            fi
+        fi
     else
-        echo "⚠️ Proxy test failed - check configuration"
-        # Thử test với localhost
-        echo "Testing with localhost..."
-        timeout 10 curl -x 127.0.0.1:$TEST_PORT -s https://httpbin.org/ip
+        echo "❌ Port $TEST_PORT is not listening"
+        echo "🔍 Available listening ports:"
+        netstat -tlnp | grep 3proxy
     fi
 }
 

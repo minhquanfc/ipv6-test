@@ -1,5 +1,10 @@
 #!/bin/sh
 
+random() {
+	tr </dev/urandom -dc A-Za-z0-9 | head -c8
+	echo
+}
+
 random_port() {
 	while :; do
 		PORT=$((RANDOM % 20001 + 30000))  # Port từ 30000–50000
@@ -11,56 +16,94 @@ random_port() {
 	done
 }
 
-array=(1 2 3 4 5 6 7 8 9 0 a b c d e f)
-main_interface=$(ip route get 8.8.8.8 | awk -- '{printf $5}')
+main_interface=$(ip route get 8.8.8.8 | awk '{print $5}')
 
-gen64() {
-	ip64() {
-		echo "${array[$RANDOM % 16]}${array[$RANDOM % 16]}${array[$RANDOM % 16]}${array[$RANDOM % 16]}"
-	}
-	while :; do
-		ipv6="$1:$(ip64):$(ip64):$(ip64):$(ip64)"
-		if ! echo "${used_ipv6s[@]}" | grep -qw "$ipv6"; then
-			used_ipv6s+=($ipv6)
-			echo $ipv6
-			return
-		fi
+# Tạo IPv6 chuẩn với format đúng
+gen_ipv6() {
+	local prefix=$1
+	local suffix=""
+
+	# Tạo 4 nhóm hex cuối (64 bit cuối)
+	for i in {1..4}; do
+		local group=$(printf "%x" $((RANDOM * RANDOM % 65536)))
+		suffix="${suffix}:${group}"
 	done
+
+	# Loại bỏ dấu : đầu tiên
+	suffix=${suffix:1}
+
+	local ipv6="${prefix}:${suffix}"
+
+	# Kiểm tra trùng lặp
+	if ! echo "${used_ipv6s[@]}" | grep -qw "$ipv6"; then
+		used_ipv6s+=($ipv6)
+		echo $ipv6
+	else
+		gen_ipv6 $prefix  # Đệ quy nếu trùng
+	fi
 }
 
 install_3proxy() {
-    echo "installing 3proxy"
+    echo "🔧 Installing 3proxy..."
     mkdir -p /3proxy
     cd /3proxy
-    URL="https://github.com/z3APA3A/3proxy/archive/0.9.3.tar.gz"
+
+    # Sử dụng phiên bản mới nhất
+    URL="https://github.com/z3APA3A/3proxy/archive/0.9.4.tar.gz"
     wget -qO- $URL | bsdtar -xvf-
-    cd 3proxy-0.9.3
+    cd 3proxy-0.9.4
     make -f Makefile.Linux
+
     mkdir -p /usr/local/etc/3proxy/{bin,logs,stat}
-    mv /3proxy/3proxy-0.9.3/bin/3proxy /usr/local/etc/3proxy/bin/
-    wget https://raw.githubusercontent.com/thuongtin/ipv4-ipv6-proxy/master/scripts/3proxy.service-Centos8 --output-document=/3proxy/3proxy-0.9.3/scripts/3proxy.service2
-    cp /3proxy/3proxy-0.9.3/scripts/3proxy.service2 /usr/lib/systemd/system/3proxy.service
-    systemctl link /usr/lib/systemd/system/3proxy.service
+    mv bin/3proxy /usr/local/etc/3proxy/bin/
+
+    # Tạo service file
+    cat > /usr/lib/systemd/system/3proxy.service <<EOF
+[Unit]
+Description=3proxy Proxy Server
+After=network.target
+
+[Service]
+Type=forking
+PIDFile=/var/run/3proxy.pid
+ExecStart=/usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg
+ExecReload=/bin/kill -USR1 \$MAINPID
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
     systemctl daemon-reload
-    echo "* hard nofile 999999" >>  /etc/security/limits.conf
-    echo "* soft nofile 999999" >>  /etc/security/limits.conf
-    echo "net.ipv6.conf.$main_interface.proxy_ndp=1" >> /etc/sysctl.conf
-    echo "net.ipv6.conf.all.proxy_ndp=1" >> /etc/sysctl.conf
-    echo "net.ipv6.conf.default.forwarding=1" >> /etc/sysctl.conf
-    echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.conf
-    echo "net.ipv6.ip_nonlocal_bind = 1" >> /etc/sysctl.conf
+    systemctl enable 3proxy
+
+    # Cấu hình hệ thống
+    echo "* hard nofile 999999" >> /etc/security/limits.conf
+    echo "* soft nofile 999999" >> /etc/security/limits.conf
+
+    # IPv6 forwarding
+    cat >> /etc/sysctl.conf <<EOF
+net.ipv6.conf.${main_interface}.proxy_ndp=1
+net.ipv6.conf.all.proxy_ndp=1
+net.ipv6.conf.default.forwarding=1
+net.ipv6.conf.all.forwarding=1
+net.ipv6.ip_nonlocal_bind=1
+net.core.somaxconn=65535
+EOF
     sysctl -p
-    systemctl stop firewalld
-    systemctl disable firewalld
+
+    # Tắt firewall
+    systemctl stop firewalld 2>/dev/null
+    systemctl disable firewalld 2>/dev/null
 
     cd $WORKDIR
 }
 
-# Config 3proxy KHÔNG CẦN AUTHENTICATION
+# Cấu hình 3proxy không cần auth
 gen_3proxy() {
     cat <<EOF
 daemon
-maxconn 4000
+maxconn 5000
 nserver 1.1.1.1
 nserver 8.8.4.4
 nserver 2001:4860:4860::8888
@@ -72,28 +115,51 @@ setuid 65535
 stacksize 6291456
 flush
 
-$(awk -F "/" '{print "proxy -6 -n -a -p" $3 " -i" $2 " -e" $4}' ${WORKDATA})
+$(awk -F "/" '{print "proxy -6 -n -a -p" $2 " -i0.0.0.0 -e" $3}' ${WORKDATA})
 EOF
 }
 
+# Tạo file proxy format: IP:PORT
 gen_proxy_file_for_user() {
-    cat >proxy.txt <<EOF
-$(awk -F "/" '{print $2 ":" $3}' ${WORKDATA})
+    cat > proxy.txt <<EOF
+$(awk -F "/" '{print $1 ":" $2}' ${WORKDATA})
 EOF
 }
 
 upload_proxy() {
     cd $WORKDIR
-    echo "✅ Proxy is ready! Format: IP:PORT (NO AUTH REQUIRED)"
-    echo "📋 Proxy list saved to: ${WORKDIR}/proxy.txt"
-    cat proxy.txt
+    local PASS=$(random)
+    zip --password $PASS proxy.zip proxy.txt
+
+    # Thử nhiều service upload
+    local URL=""
+    for service in "https://0x0.st" "https://transfer.sh" "https://file.io"; do
+        if [ "$service" = "https://transfer.sh" ]; then
+            URL=$(curl -s --upload-file proxy.zip https://transfer.sh/proxy.zip)
+        elif [ "$service" = "https://file.io" ]; then
+            URL=$(curl -s -F file=@proxy.zip https://file.io | jq -r .link 2>/dev/null)
+        else
+            URL=$(curl -s -F file=@proxy.zip $service)
+        fi
+
+        if [ ! -z "$URL" ] && [ "$URL" != "null" ]; then
+            break
+        fi
+    done
+
+    echo ""
+    echo "✅ Proxy is ready! Format: IP:PORT (No authentication required)"
+    echo "📊 Total proxies created: $COUNT"
+    echo "📦 Download link: ${URL}"
+    echo "🔐 Archive password: ${PASS}"
+    echo "🌐 IPv4: $IP4 | IPv6 Subnet: $IP6"
 }
 
-# Data format: IP/PORT/IPV6 (không có user/pass)
 gen_data() {
     for i in $(seq 1 $COUNT); do
         PORT=$(random_port)
-        echo "$IP4/$PORT/$(gen64 $IP6)"
+        IPV6=$(gen_ipv6 $IP6)
+        echo "$IP4/$PORT/$IPV6"
     done
 }
 
@@ -105,172 +171,128 @@ EOF
 
 gen_ifconfig() {
     cat <<EOF
-$(awk -F "/" '{print "ifconfig '$main_interface' inet6 add " $3 "/64"}' ${WORKDATA})
+$(awk -F "/" '{print "ip -6 addr add " $3 "/128 dev '$main_interface'"}' ${WORKDATA})
 EOF
 }
 
-optimize_system() {
-    echo "🔧 Optimizing system for proxy performance..."
-
-    # Tăng giới hạn kết nối
-    cat >> /etc/sysctl.conf << EOF
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 5000
-net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 60
-net.ipv4.tcp_keepalive_probes = 3
-net.ipv4.ip_local_port_range = 1024 65535
-fs.file-max = 2097152
-EOF
-
-    sysctl -p
-
-    # Cập nhật limits
-    cat >> /etc/security/limits.conf << EOF
-* soft nofile 1048576
-* hard nofile 1048576
-* soft nproc 1048576
-* hard nproc 1048576
-root soft nofile 1048576
-root hard nofile 1048576
-EOF
-}
-
-restart_3proxy() {
-    echo "🔄 Restarting 3proxy service..."
-    systemctl stop 3proxy 2>/dev/null || killall 3proxy 2>/dev/null
-    sleep 2
-
-    # Test config trước khi start
-    echo "🧪 Testing 3proxy config..."
-    /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg -t
-
-    if [ $? -eq 0 ]; then
-        echo "✅ Config syntax is OK"
-        systemctl start 3proxy
-        systemctl enable 3proxy
-
-        if systemctl is-active --quiet 3proxy; then
-            echo "✅ 3proxy started successfully"
-        else
-            echo "⚠️ Starting 3proxy manually..."
-            /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
-        fi
-    else
-        echo "❌ Config syntax error!"
+# Kiểm tra IPv6 support
+check_ipv6() {
+    if [ ! -f /proc/net/if_inet6 ]; then
+        echo "❌ IPv6 is not supported on this system!"
         exit 1
     fi
-}
 
-test_proxy() {
-    echo "🧪 Testing first proxy..."
-    FIRST_PROXY=$(head -n1 ${WORKDATA})
-    TEST_IP=$(echo $FIRST_PROXY | cut -d'/' -f1)
-    TEST_PORT=$(echo $FIRST_PROXY | cut -d'/' -f2)
-
-    echo "Testing: $TEST_IP:$TEST_PORT (NO AUTH)"
-
-    # Kiểm tra port có listen không
-    if netstat -tlnp | grep ":$TEST_PORT " > /dev/null; then
-        echo "✅ Port $TEST_PORT is listening"
-
-        # Test connection without authentication
-        echo "🌐 Testing proxy connection..."
-        RESULT=$(timeout 10 curl -x $TEST_IP:$TEST_PORT -s https://httpbin.org/ip 2>/dev/null)
-
-        if [ $? -eq 0 ] && [ ! -z "$RESULT" ]; then
-            echo "✅ Proxy test successful!"
-            echo "📍 Response: $RESULT"
-        else
-            echo "⚠️ External test failed, trying localhost..."
-            RESULT=$(timeout 10 curl -x 127.0.0.1:$TEST_PORT -s https://httpbin.org/ip 2>/dev/null)
-            if [ $? -eq 0 ] && [ ! -z "$RESULT" ]; then
-                echo "✅ Localhost test successful!"
-            else
-                echo "❌ Proxy test failed"
-                echo "🔍 Checking 3proxy process..."
-                ps aux | grep 3proxy | grep -v grep
-                echo "🔍 Checking listening ports..."
-                netstat -tlnp | grep 3proxy
-            fi
-        fi
-    else
-        echo "❌ Port $TEST_PORT is not listening"
-        echo "🔍 Available listening ports:"
-        netstat -tlnp | grep 3proxy
+    if ! ping6 -c1 2001:4860:4860::8888 >/dev/null 2>&1; then
+        echo "⚠️ Warning: IPv6 connectivity test failed. Proxies may not work properly."
     fi
 }
 
 # == MAIN SETUP ==
+echo "🚀 IPv6 Proxy Generator - Optimized Version"
+echo "============================================"
+
+# Kiểm tra quyền root
+if [ "$(id -u)" != "0" ]; then
+   echo "❌ This script must be run as root"
+   exit 1
+fi
+
+check_ipv6
+
 echo "🛠️ Installing packages..."
-yum -y install gcc net-tools bsdtar zip make curl >/dev/null
+yum -y install gcc net-tools bsdtar zip make curl jq >/dev/null 2>&1
 
 WORKDIR="/home/proxy-installer"
 WORKDATA="${WORKDIR}/data.txt"
 mkdir -p $WORKDIR && cd $WORKDIR
 
-IP4=$(curl -4 -s icanhazip.com)
-IP6=$(curl -6 -s icanhazip.com | cut -f1-4 -d':')
+# Lấy IP
+echo "🌐 Getting IP addresses..."
+IP4=$(curl -4 -s --connect-timeout 10 icanhazip.com)
+IP6=$(curl -6 -s --connect-timeout 10 icanhazip.com | cut -f1-4 -d':')
 
-if [ -z "$IP4" ] || [ -z "$IP6" ]; then
-    echo "⚠️ Không thể lấy IP address. Vui lòng kiểm tra kết nối mạng!"
+if [ -z "$IP4" ]; then
+    echo "❌ Cannot get IPv4 address"
     exit 1
 fi
 
-echo "🌐 Internal IP: $IP4 — IPv6 Subnet: $IP6"
-
-# Ask user how many proxies to create
-read -p "❓ Nhập số lượng proxy muốn tạo: " COUNT
-if ! echo "$COUNT" | grep -Eq '^[0-9]+$' || [ "$COUNT" -le 0 ] || [ "$COUNT" -gt 1000 ]; then
-    echo "⚠️ Số lượng không hợp lệ! (1-1000)"
+if [ -z "$IP6" ]; then
+    echo "❌ Cannot get IPv6 subnet"
     exit 1
 fi
 
+echo "✅ IPv4: $IP4"
+echo "✅ IPv6 Subnet: $IP6"
+
+# Hỏi số lượng proxy
+while true; do
+    read -p "❓ Enter number of proxies to create (1-1000): " COUNT
+    if echo "$COUNT" | grep -Eq '^[0-9]+$' && [ "$COUNT" -ge 1 ] && [ "$COUNT" -le 1000 ]; then
+        break
+    else
+        echo "⚠️ Please enter a valid number between 1 and 1000!"
+    fi
+done
+
+echo "⏳ Creating $COUNT proxies..."
+
+# Khởi tạo mảng
 used_ports=()
 used_ipv6s=()
 
-optimize_system
 install_3proxy
 
-echo "🔧 Generating proxy configuration..."
-gen_data >$WORKDATA
-gen_iptables >$WORKDIR/boot_iptables.sh
-gen_ifconfig >$WORKDIR/boot_ifconfig.sh
-echo NM_CONTROLLED="no" >> /etc/sysconfig/network-scripts/ifcfg-${main_interface}
-chmod +x $WORKDIR/boot_*.sh /etc/rc.local
+# Tạo dữ liệu
+echo "📝 Generating proxy data..."
+gen_data > $WORKDATA
 
-gen_3proxy >/usr/local/etc/3proxy/3proxy.cfg
+echo "🔥 Configuring firewall rules..."
+gen_iptables > $WORKDIR/boot_iptables.sh
 
-cat >>/etc/rc.local <<EOF
+echo "🌐 Configuring IPv6 addresses..."
+gen_ifconfig > $WORKDIR/boot_ifconfig.sh
+
+# Cấu hình network
+echo 'NM_CONTROLLED="no"' >> /etc/sysconfig/network-scripts/ifcfg-${main_interface}
+chmod +x $WORKDIR/boot_*.sh
+
+# Tạo cấu hình 3proxy
+echo "⚙️ Generating 3proxy configuration..."
+gen_3proxy > /usr/local/etc/3proxy/3proxy.cfg
+
+# Tạo startup script
+cat > /etc/rc.local <<EOF
 #!/bin/bash
+touch /var/lock/subsys/local
 systemctl start NetworkManager.service
 bash ${WORKDIR}/boot_iptables.sh
 bash ${WORKDIR}/boot_ifconfig.sh
-ulimit -n 1048576
+ulimit -n 999999
 systemctl start 3proxy
 EOF
 
 chmod +x /etc/rc.local
 
-# Chạy các lệnh cấu hình
+# Khởi động các service
+echo "🚀 Starting services..."
 bash $WORKDIR/boot_iptables.sh
 bash $WORKDIR/boot_ifconfig.sh
+systemctl start 3proxy
 
-restart_3proxy
+# Kiểm tra trạng thái
+if systemctl is-active --quiet 3proxy; then
+    echo "✅ 3proxy service is running"
+else
+    echo "❌ 3proxy service failed to start"
+    systemctl status 3proxy
+fi
 
+# Tạo và upload file proxy
+echo "📦 Preparing proxy list..."
 gen_proxy_file_for_user
-test_proxy
 upload_proxy
 
 echo ""
-echo "🎯 Proxy setup completed! (NO AUTHENTICATION REQUIRED)"
-echo "📋 Configuration saved in: $WORKDATA"
-echo "⚡ 3proxy config: /usr/local/etc/3proxy/3proxy.cfg"
-echo ""
-echo "📝 Proxy format: IP:PORT"
-echo "🔍 To check proxy status: systemctl status 3proxy"
-echo "📊 To view logs: journalctl -u 3proxy -f"
-echo ""
-echo "⚠️  WARNING: These proxies have NO AUTHENTICATION!"
-echo "🔒 Anyone can use them if they know IP:PORT"
+echo "🎉 Setup completed successfully!"
+echo "💡 Tip: Proxies work without username/password authentication"
+echo "🔄 Service will auto-start on reboot"

@@ -1,10 +1,5 @@
 #!/bin/sh
 
-random() {
-	tr </dev/urandom -dc A-Za-z0-9 | head -c8  # Tăng độ dài từ 5 lên 8
-	echo
-}
-
 random_port() {
 	while :; do
 		PORT=$((RANDOM % 20001 + 30000))  # Port từ 30000–50000
@@ -61,6 +56,7 @@ install_3proxy() {
     cd $WORKDIR
 }
 
+# Config 3proxy KHÔNG CẦN AUTHENTICATION
 gen_3proxy() {
     cat <<EOF
 daemon
@@ -76,69 +72,43 @@ setuid 65535
 stacksize 6291456
 flush
 
-# Cấu hình authentication cho từng user
-$(awk -F "/" '{print "auth strong\n" \
-"allow " $1 " * * " $3 ":" $4 "\n" \
-"proxy -6 -n -a -p" $4 " -i" $3 " -e"$5" -u" $1 " -P" $2 "\n" \
-"flush\n"}' ${WORKDATA})
+$(awk -F "/" '{print "proxy -6 -n -a -p" $3 " -i" $2 " -e" $4}' ${WORKDATA})
 EOF
 }
 
 gen_proxy_file_for_user() {
     cat >proxy.txt <<EOF
-$(awk -F "/" '{print $3 ":" $4 ":" $1 ":" $2 }' ${WORKDATA})
+$(awk -F "/" '{print $2 ":" $3}' ${WORKDATA})
 EOF
 }
 
 upload_proxy() {
     cd $WORKDIR
-    local PASS=$(random)
-    zip --password $PASS proxy.zip proxy.txt
-    URL=$(curl -s -F file=@proxy.zip https://0x0.st)
-    echo "✅ Proxy is ready! Format: IP:PORT:LOGIN:PASS"
-    echo "📦 Download zip archive from: ${URL}"
-    echo "🔐 Password: ${PASS}"
+    echo "✅ Proxy is ready! Format: IP:PORT (NO AUTH REQUIRED)"
+    echo "📋 Proxy list saved to: ${WORKDIR}/proxy.txt"
+    cat proxy.txt
 }
 
+# Data format: IP/PORT/IPV6 (không có user/pass)
 gen_data() {
     for i in $(seq 1 $COUNT); do
         PORT=$(random_port)
-        USER=$(random)
-        PASS=$(random)
-        echo "$USER/$PASS/$IP4/$PORT/$(gen64 $IP6)"
+        echo "$IP4/$PORT/$(gen64 $IP6)"
     done
 }
 
 gen_iptables() {
     cat <<EOF
-$(awk -F "/" '{print "iptables -I INPUT -p tcp --dport " $4 " -m state --state NEW -j ACCEPT"}' ${WORKDATA})
+$(awk -F "/" '{print "iptables -I INPUT -p tcp --dport " $2 " -m state --state NEW -j ACCEPT"}' ${WORKDATA})
 EOF
 }
 
 gen_ifconfig() {
     cat <<EOF
-$(awk -F "/" '{print "ifconfig '$main_interface' inet6 add " $5 "/64"}' ${WORKDATA})
+$(awk -F "/" '{print "ifconfig '$main_interface' inet6 add " $3 "/64"}' ${WORKDATA})
 EOF
 }
 
-# Thêm hàm kiểm tra và khởi động lại 3proxy
-restart_3proxy() {
-    echo "🔄 Restarting 3proxy service..."
-    systemctl stop 3proxy 2>/dev/null || killall 3proxy 2>/dev/null
-    sleep 2
-    systemctl start 3proxy
-    systemctl enable 3proxy
-
-    # Kiểm tra trạng thái
-    if systemctl is-active --quiet 3proxy; then
-        echo "✅ 3proxy started successfully"
-    else
-        echo "⚠️ Starting 3proxy manually..."
-        /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
-    fi
-}
-
-# Thêm hàm tối ưu hệ thống
 optimize_system() {
     echo "🔧 Optimizing system for proxy performance..."
 
@@ -165,6 +135,53 @@ EOF
 root soft nofile 1048576
 root hard nofile 1048576
 EOF
+}
+
+restart_3proxy() {
+    echo "🔄 Restarting 3proxy service..."
+    systemctl stop 3proxy 2>/dev/null || killall 3proxy 2>/dev/null
+    sleep 2
+
+    # Test config trước khi start
+    echo "🧪 Testing 3proxy config..."
+    /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg -t
+
+    if [ $? -eq 0 ]; then
+        echo "✅ Config syntax is OK"
+        systemctl start 3proxy
+        systemctl enable 3proxy
+
+        if systemctl is-active --quiet 3proxy; then
+            echo "✅ 3proxy started successfully"
+        else
+            echo "⚠️ Starting 3proxy manually..."
+            /usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg &
+        fi
+    else
+        echo "❌ Config syntax error!"
+        exit 1
+    fi
+}
+
+test_proxy() {
+    echo "🧪 Testing first proxy..."
+    FIRST_PROXY=$(head -n1 ${WORKDATA})
+    TEST_IP=$(echo $FIRST_PROXY | cut -d'/' -f1)
+    TEST_PORT=$(echo $FIRST_PROXY | cut -d'/' -f2)
+
+    echo "Testing: $TEST_IP:$TEST_PORT (NO AUTH)"
+
+    # Test connection without authentication
+    timeout 10 curl -x $TEST_IP:$TEST_PORT -s https://httpbin.org/ip
+
+    if [ $? -eq 0 ]; then
+        echo "✅ Proxy test successful!"
+    else
+        echo "⚠️ Proxy test failed - check configuration"
+        # Thử test với localhost
+        echo "Testing with localhost..."
+        timeout 10 curl -x 127.0.0.1:$TEST_PORT -s https://httpbin.org/ip
+    fi
 }
 
 # == MAIN SETUP ==
@@ -225,12 +242,17 @@ bash $WORKDIR/boot_ifconfig.sh
 restart_3proxy
 
 gen_proxy_file_for_user
+test_proxy
 upload_proxy
 
 echo ""
-echo "🎯 Proxy setup completed!"
+echo "🎯 Proxy setup completed! (NO AUTHENTICATION REQUIRED)"
 echo "📋 Configuration saved in: $WORKDATA"
 echo "⚡ 3proxy config: /usr/local/etc/3proxy/3proxy.cfg"
 echo ""
+echo "📝 Proxy format: IP:PORT"
 echo "🔍 To check proxy status: systemctl status 3proxy"
 echo "📊 To view logs: journalctl -u 3proxy -f"
+echo ""
+echo "⚠️  WARNING: These proxies have NO AUTHENTICATION!"
+echo "🔒 Anyone can use them if they know IP:PORT"

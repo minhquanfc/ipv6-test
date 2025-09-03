@@ -1,36 +1,36 @@
 #!/bin/sh
 
 random() {
-    tr </dev/urandom -dc A-Za-z0-9 | head -c5
-    echo
+	tr </dev/urandom -dc A-Za-z0-9 | head -c5
+	echo
 }
 
 random_port() {
-    while :; do
-        PORT=$((RANDOM % 20001 + 30000))
-        if ! echo "${used_ports[@]}" | grep -qw "$PORT"; then
-            used_ports+=($PORT)
-            echo $PORT
-            return
-        fi
-    done
+	while :; do
+		PORT=$((RANDOM % 20001 + 30000))  # Port từ 30000–50000
+		if ! echo "${used_ports[@]}" | grep -qw "$PORT"; then
+			used_ports+=($PORT)
+			echo $PORT
+			return
+		fi
+	done
 }
 
 array=(1 2 3 4 5 6 7 8 9 0 a b c d e f)
 main_interface=$(ip route get 8.8.8.8 | awk -- '{printf $5}')
 
 gen64() {
-    ip64() {
-        echo "${array[$RANDOM % 16]}${array[$RANDOM % 16]}${array[$RANDOM % 16]}${array[$RANDOM % 16]}"
-    }
-    while :; do
-        ipv6="$1:$(ip64):$(ip64):$(ip64):$(ip64)"
-        if ! echo "${used_ipv6s[@]}" | grep -qw "$ipv6"; then
-            used_ipv6s+=($ipv6)
-            echo $ipv6
-            return
-        fi
-    done
+	ip64() {
+		echo "${array[$RANDOM % 16]}${array[$RANDOM % 16]}${array[$RANDOM % 16]}${array[$RANDOM % 16]}"
+	}
+	while :; do
+		ipv6="$1:$(ip64):$(ip64):$(ip64):$(ip64)"
+		if ! echo "${used_ipv6s[@]}" | grep -qw "$ipv6"; then
+			used_ipv6s+=($ipv6)
+			echo $ipv6
+			return
+		fi
+	done
 }
 
 install_3proxy() {
@@ -47,8 +47,8 @@ install_3proxy() {
     cp /3proxy/3proxy-0.9.3/scripts/3proxy.service2 /usr/lib/systemd/system/3proxy.service
     systemctl link /usr/lib/systemd/system/3proxy.service
     systemctl daemon-reload
-    echo "* hard nofile 999999" >> /etc/security/limits.conf
-    echo "* soft nofile 999999" >> /etc/security/limits.conf
+    echo "* hard nofile 999999" >>  /etc/security/limits.conf
+    echo "* soft nofile 999999" >>  /etc/security/limits.conf
     echo "net.ipv6.conf.$main_interface.proxy_ndp=1" >> /etc/sysctl.conf
     echo "net.ipv6.conf.all.proxy_ndp=1" >> /etc/sysctl.conf
     echo "net.ipv6.conf.default.forwarding=1" >> /etc/sysctl.conf
@@ -76,20 +76,15 @@ setuid 65535
 stacksize 6291456
 flush
 
-# Fixed authentication configuration
-auth strong
-users proxy:CL:proxy
-
-$(awk -F "/" '{print "auth strong\\n" \
-"allow proxy\\n" \
-"proxy -6 -n -a -p" $4 " -i" $3 " -e"$5"\\n" \
-"flush\\n"}' ${WORKDATA})
+$(awk -F "/" '{print \
+"proxy -6 -n -p" $4 " -i" $3 " -e"$5"\n" \
+"flush\n"}' ${WORKDATA})
 EOF
 }
 
 gen_proxy_file_for_user() {
     cat >proxy.txt <<EOF
-$(awk -F "/" '{print $3 ":" $4 ":proxy:proxy"}' ${WORKDATA})
+$(awk -F "/" '{print $3 ":" $4}' ${WORKDATA})
 EOF
 }
 
@@ -101,8 +96,6 @@ upload_proxy() {
     echo "✅ Proxy is ready! Format: IP:PORT:LOGIN:PASS"
     echo "📦 Download zip archive from: ${URL}"
     echo "🔐 Password: ${PASS}"
-    echo "👤 Proxy username: proxy"
-    echo "🔑 Proxy password: proxy"
 }
 
 gen_data() {
@@ -124,7 +117,7 @@ $(awk -F "/" '{print "ifconfig '$main_interface' inet6 add " $5 "/64"}' ${WORKDA
 EOF
 }
 
-# Main setup
+# == MAIN SETUP ==
 echo "🛠️ Installing packages..."
 yum -y install gcc net-tools bsdtar zip make curl >/dev/null
 
@@ -136,6 +129,7 @@ IP4=$(curl -4 -s icanhazip.com)
 IP6=$(curl -6 -s icanhazip.com | cut -f1-4 -d':')
 echo "🌐 Internal IP: $IP4 — IPv6 Subnet: $IP6"
 
+# Ask user how many proxies to create
 read -p "❓ Nhập số lượng proxy muốn tạo: " COUNT
 if ! echo "$COUNT" | grep -Eq '^[0-9]+$' || [ "$COUNT" -le 0 ]; then
     echo "⚠️ Số lượng không hợp lệ!"
